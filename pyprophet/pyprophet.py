@@ -16,9 +16,10 @@ from stats import (lookup_s_and_q_values_from_error_table, calculate_final_stati
                    mean_and_std_dev, final_err_table, summary_err_table, pnorm, find_cutoff, posterior_pg_prob)
 from stats import posterior_chromatogram_hypotheses_fast
 from config import CONFIG
+from misc import nice_time
 
 from data_handling import (prepare_data_table, Experiment)
-from classifiers import (LDALearner, ConsensusPredictor)
+from classifiers import (LDALearner, ConsensusPredictor, LinearPredictor)
 from semi_supervised import (AbstractSemiSupervisedTeacher, StandardSemiSupervisedTeacher)
 
 from error_table import FlexibleErrorTable
@@ -69,17 +70,10 @@ class HolyGostQuery(object):
 			data_for_persistence = None
 		else:
 			logging.info("learn and apply scorer to %s" % path)
-			result_tables, clf_scores, data_for_persistence, trained_weights = self.tutor_and_apply_classifier(table)
+			result_tables, clf_scores, data_for_persistence, trained_weights = self.tutor_and_apply_classifier(table, p_score, loaded_weights)
+		
 		logging.info("processing %s finished" % path)
-
-		needed = time.time() - start_at
-		hours = int(needed / 3600)
-		needed -= hours * 3600
-
-		minutes = int(needed / 60)
-		needed -= minutes * 60
-
-		logging.info("time needed: %02d:%02d:%.1f" % (hours, minutes, needed))
+		logging.info("time needed: %s" % (nice_time(time.time() - start_at)))
 		return result_tables, clf_scores, data_for_persistence, trained_weights
 
 
@@ -150,18 +144,20 @@ class HolyGostQuery(object):
 			logging.info("finished cross evals")
 		else:
 			logging.info("start application of pretrained weights")
-			ws.append(loaded_weights.flatten())
-			clf_scores = teacher.score(experiment, loaded_weights)
+			loaded_clf = LinearPredictor(loaded_weights)
+			clfs.append(loaded_clf)
+			clf_scores = loaded_clf.score(experiment, True)
 			experiment.set_and_rerank("classifier_score", clf_scores)
-
 			all_test_target_scores.extend(experiment.get_top_target_peaks()["classifier_score"])
 			all_test_decoy_scores.extend(experiment.get_top_decoy_peaks()["classifier_score"])
 			logging.info("finished pretrained scoring")
 			
 
 		final_classifier = ConsensusPredictor(clfs)
-		loaded_weights = final_classifier.get_parameters()
-		
+		# TODO: How to solve this for general (non-linear) predictors?
+		# ... maybe just ignore for now
+		loaded_weights = final_classifier.get_coefs()
+
 		d = {}
 		d["tg_id"] = experiment.df.tg_num_id.values
 		d["decoy"] = experiment.df.is_decoy.values
@@ -174,7 +170,7 @@ class HolyGostQuery(object):
 		for c in score_columns:
 			d[c] = table[c]
 
-		results, data_for_persistence = self.apply_classifier(final_classifier, experiment, test_exp,
+		results, res_dict, data_for_persistence = self.apply_classifier(final_classifier, experiment, test_exp,
 															 all_test_target_scores,
 															 all_test_decoy_scores, table, p_score=p_score)
 		logging.info("calculated scoring and statistics")
@@ -196,9 +192,9 @@ class HolyGostQuery(object):
 
 		scored_table = self.enrich_table_with_results(table, experiment, df_raw_stat)
 
-		trained_weights = final_classifier.get_parameters()
+		trained_weights = final_classifier.get_coefs()
 
-		return {'pyProph':(None, None, scored_table)}, None, None, trained_weights
+		return (None, None, scored_table), None, None, trained_weights
 
 
 
@@ -235,37 +231,37 @@ class HolyGostQuery(object):
 
 		is_test	 = CONFIG.get("is_test", False)
 		
-		if CONFIG.get("is_test", False):
+		if is_test:
 			d = {
-				'pyProph-flex':FlexibleErrorTable(
+				'pyProph':FlexibleErrorTable(
 									all_tt_scores,
 									all_test_target_scores,
 									all_test_decoy_scores,
 									lambda_,
 									NormalNullModel(),
-									PyProphFDRCalc(),
-									PyProphStatCalc(),
-									PyProphStatSampler()
-							), 
-				'nonParam-flex':FlexibleErrorTable(
+									MProphFDRCalc(),
+									MProphStatCalc(),
+									MProphStatSampler()
+							),
+				'nonParam':FlexibleErrorTable(
 									all_tt_scores,
 									all_test_target_scores,
 									all_test_decoy_scores,
 									lambda_,
 									NonParamNullModel(),
-									PyProphFDRCalc(),
-									PyProphStatCalc(),
-									PyProphStatSampler()
+									MProphFDRCalc(),
+									MProphStatCalc(),
+									MProphStatSampler()
 							),
-				'logNormal-flex':FlexibleErrorTable(
+				'logNormal':FlexibleErrorTable(
 									all_tt_scores,
 									all_test_target_scores,
 									all_test_decoy_scores,
 									lambda_,
 									LogNormalNullModel(),
-									PyProphFDRCalc(),
-									PyProphStatCalc(),
-									PyProphStatSampler()
+									MProphFDRCalc(),
+									MProphStatCalc(),
+									MProphStatSampler()
 							),
 				'nonParam-storey':FlexibleErrorTable(
 									all_tt_scores,
@@ -274,8 +270,8 @@ class HolyGostQuery(object):
 									lambda_,
 									NonParamNullModel(),
 									StoreyFDRCalc(),
-									PyProphStatCalc(),
-									PyProphStatSampler()
+									MProphStatCalc(),
+									MProphStatSampler()
 							),
 				'nonParam-storey-jt':FlexibleErrorTable(
 									all_tt_scores,
@@ -285,11 +281,11 @@ class HolyGostQuery(object):
 									NonParamNullModel(),
 									StoreyFDRCalc(),
 									JTStatCalc(),
-									PyProphStatSampler()
+									MProphStatSampler()
 							)
 				}
 			
-			d["res"] = d["nonParam-flex"]
+			d["res"] = d["pyProph"]
 		
 			if test_exp is not None:
 				muT, nuT, final_scoreT = self.calculate_params_for_d_score(final_classifier, test_exp)
@@ -300,9 +296,9 @@ class HolyGostQuery(object):
 						test_exp.get_top_decoy_peaks()["d_score"],
 						lambda_,
 						NormalNullModel(),
-						PyProphFDRCalc(),
-						PyProphStatCalc(),
-						PyProphStatSampler()
+						MProphFDRCalc(),
+						MProphStatCalc(),
+						MProphStatSampler()
 					)
 				d['true_nonParam'] = FlexibleErrorTable(
 						all_tt_scores, 
@@ -310,9 +306,9 @@ class HolyGostQuery(object):
 						test_exp.get_top_decoy_peaks()["d_score"],
 						lambda_,
 						NonParamNullModel(),
-						PyProphFDRCalc(),
-						PyProphStatCalc(),
-						PyProphStatSampler()
+						MProphFDRCalc(),
+						MProphStatCalc(),
+						MProphStatSampler()
 					)
 				d['true_logNormal'] = FlexibleErrorTable(
 						all_tt_scores,
@@ -320,9 +316,9 @@ class HolyGostQuery(object):
 						test_exp.get_top_decoy_peaks()["d_score"],
 						lambda_,
 						LogNormalNullModel(),
-						PyProphFDRCalc(),
-						PyProphStatCalc(),
-						PyProphStatSampler()
+						MProphFDRCalc(),
+						MProphStatCalc(),
+						MProphStatSampler()
 					)
 		else:
 			 null_model 	= getNullModel(CONFIG.get("final_statistics.null_model"))
@@ -348,7 +344,7 @@ class HolyGostQuery(object):
 			return (et.summary_table(), et.final_table(), et.enrich(table, experiment))
 
 		et = d["res"]
-		sum_tab, fin_tab, score_tab = getRes(d["res"])
+		sum_tab, fin_tab, score_tab = getRes(et)
 
 		if CONFIG.get("compute.probabilities"):
 			logging.info( "" )
@@ -367,8 +363,9 @@ class HolyGostQuery(object):
 
 			logging.info( "Prior for a peakgroup: %s" % (number_true_chromatograms / number_target_pg))
 			logging.info( "Prior for a chromatogram: %s" % str(1-prior_chrom_null) )
-			logging.info( "Estimated number of true chromatograms: %s out of %s" % (number_true_chromatograms, le$
-			logging.info( "Number of target data: %s" % len( Experiment(experiment.df[(experiment.df.is_decoy == $
+			logging.info( "Estimated number of true chromatograms: %s out of %s" % (
+				number_true_chromatograms, len(experiment.get_top_target_peaks().df)) )
+			logging.info( "Number of target data: %s" % len( Experiment(experiment.df[(experiment.df.is_decoy == False) ]).df ) )
 
 			# pg_score = posterior probability for each peakgroup
 			# h_score = posterior probability for the hypothesis that this peakgroup is true (and all other false)
@@ -407,4 +404,4 @@ class HolyGostQuery(object):
 
 @profile
 def PyProphet():
-	return HolyGostQuery(StandardSemiSupervisedTeacher(LDALearner()))
+	return HolyGostQuery(StandardSemiSupervisedTeacher(LDALearner))

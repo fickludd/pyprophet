@@ -19,7 +19,7 @@ def standard_config(n_cpus=1):
         n_cpus = multiprocessing.cpu_count()
 
     CONFIG["decoy.missing"] = 0.0 
-    CONFIG["train.fraction"] = 0.7
+    CONFIG["train.fraction"] = 1.0
     
     CONFIG["no.file.output"] = False
     CONFIG["all.output"] = False
@@ -119,3 +119,8 @@ def fix_config_types(dd):
 
     if dd["delim.out"] == "tab":
         dd["delim.out"] = "\t"
+
+
+def get_invalid_params(std, custom):
+    return [k for k in custom.keys() if k not in std]
+            

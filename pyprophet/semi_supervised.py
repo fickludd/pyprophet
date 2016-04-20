@@ -62,7 +62,7 @@ class AbstractSemiSupervisedTeacher(object):
 #        p95 = np.percentile(td_scores, 95.0)
 #        print mid, p95
 
-	mu, nu = mean_and_std_dev(td_scores)
+        mu, nu = mean_and_std_dev(td_scores)
         student.post_scaler = ShiftDivScaler(mu, nu)
         experiment["classifier_score"] = student.post_scaler.scale(experiment["classifier_score"])
         experiment.rank_by("classifier_score")
