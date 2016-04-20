@@ -5,15 +5,16 @@ import os
 os.putenv("OPENBLAS_NUM_THREADS", "1")
 
 try:
-	profile  # ignore
-except:
-	profile = lambda x: x
+    profile
+except NameError:
+    profile = lambda x: x
 
 import pandas as pd
 import numpy as np
 
 from stats import (lookup_s_and_q_values_from_error_table, calculate_final_statistics,
-				   mean_and_std_dev, final_err_table, summary_err_table)
+                   mean_and_std_dev, final_err_table, summary_err_table, pnorm, find_cutoff, posterior_pg_prob)
+from stats import posterior_chromatogram_hypotheses_fast
 from config import CONFIG
 
 from data_handling import (prepare_data_table, Experiment)
@@ -29,7 +30,6 @@ import multiprocessing
 import logging
 
 import time
-
 
 def unwrap_self_for_multiprocessing((inst, method_name, args),):
 	""" You can not call methods with multiprocessing, but free functions,
@@ -53,8 +53,10 @@ class HolyGostQuery(object):
 						  AbstractSemiSupervisedTeacher)
 		self.semi_supervised_teacher = semi_supervised_teacher
 
+
+
 	@profile
-	def process_csv(self, path, delim=",", loaded_scorer=None):
+	def process_csv(self, path, delim=",", loaded_scorer=None, loaded_weights=None, p_score=False):
 		start_at = time.time()
 
 		logging.info("read %s" % path)
@@ -63,11 +65,11 @@ class HolyGostQuery(object):
 
 		if loaded_scorer is not None:
 			logging.info("apply scorer to  %s" % path)
-			result_tables, clf_scores, data_for_persistence = self.apply_loaded_scorer(table, loaded_scorer)
+			result_tables, clf_scores, data_for_persistence, trained_weights = self.apply_loaded_scorer(table, loaded_scorer)
 			data_for_persistence = None
 		else:
 			logging.info("learn and apply scorer to %s" % path)
-			result_tables, clf_scores, data_for_persistence = self.tutor_and_apply_classifier(table)
+			result_tables, clf_scores, data_for_persistence, trained_weights = self.tutor_and_apply_classifier(table)
 		logging.info("processing %s finished" % path)
 
 		needed = time.time() - start_at
@@ -78,11 +80,11 @@ class HolyGostQuery(object):
 		needed -= minutes * 60
 
 		logging.info("time needed: %02d:%02d:%.1f" % (hours, minutes, needed))
-		return result_tables, clf_scores, data_for_persistence
+		return result_tables, clf_scores, data_for_persistence, trained_weights
 
 
 	@profile
-	def tutor_and_apply_classifier(self, table):
+	def tutor_and_apply_classifier(self, table, p_score=False, loaded_weights=None):
 
 		prepared_table, score_columns = prepare_data_table(table)
 
@@ -98,12 +100,13 @@ class HolyGostQuery(object):
 		all_test_target_scores = []
 		all_test_decoy_scores = []
 		clfs = []
+		ws = [] # are ws and clfs redundant?
 		
 		train_frac	 = CONFIG.get("train.fraction")
 		is_test	 = CONFIG.get("is_test", False)
 		neval		 = CONFIG.get("xeval.num_iter")
 		fraction = CONFIG.get("xeval.fraction")
-		teacher	 = self.semi_supervised_teacher
+		teacher	 = self.semi_supervised_teacher # inst
 		num_processes = CONFIG.get("num_processes")
 		
 		# reserve part of experiment for testing and FDR calc.
@@ -118,33 +121,46 @@ class HolyGostQuery(object):
 			train_exp.set_xval_sets(neval, is_test)
 			xval_sets = xval_sets(neval, int(fraction * neval + 0.5))
 				
-		logging.info("start %d cross evals using %d processes" % (neval, num_processes))
-		if num_processes == 1:
-			for k in range(neval):
-				if xval_type == "split":
-					train_exp.train_on_xval_sets(xval_sets[k])
-				else:
-					train_exp.split_train_test(fraction, is_test)
-				(ttt_scores, ttd_scores, clf) = teacher.tutor_randomized(train_exp)
-				all_test_target_scores.extend(ttt_scores)
-				all_test_decoy_scores.extend(ttd_scores)
-				clfs.append(clf)
-		else:
-			pool = multiprocessing.Pool(processes=num_processes)
-			while neval:
-				remaining = max(0, neval - num_processes)
-				todo = neval - remaining
-				neval -= todo
-				args = ((teacher, "tutor_randomized", (train_exp, )), ) * todo
-				res = pool.map(unwrap_self_for_multiprocessing, args)
-				top_test_target_scores = [ti for r in res for ti in r[0]]
-				top_test_decoy_scores = [ti for r in res for ti in r[1]]
-				clfs.extend([r[2] for r in res])
-				all_test_target_scores.extend(top_test_target_scores)
-				all_test_decoy_scores.extend(top_test_decoy_scores)
+		if loaded_weights == None:
+			logging.info("start %d cross evals using %d processes" % (neval, num_processes))
+			if num_processes == 1:
+				for k in range(neval):
+					if xval_type == "split":
+						train_exp.train_on_xval_sets(xval_sets[k])
+					else:
+						train_exp.split_train_test(fraction, is_test)
+					(ttt_scores, ttd_scores, clf) = teacher.tutor_randomized(train_exp)
+					all_test_target_scores.extend(ttt_scores)
+					all_test_decoy_scores.extend(ttd_scores)
+					clfs.append(clf)
+			else:
+				pool = multiprocessing.Pool(processes=num_processes)
+				while neval:
+					remaining = max(0, neval - num_processes)
+					todo = neval - remaining
+					neval -= todo
+					args = ((teacher, "tutor_randomized", (train_exp, )), ) * todo
+					res = pool.map(unwrap_self_for_multiprocessing, args)
+					top_test_target_scores = [ti for r in res for ti in r[0]]
+					top_test_decoy_scores = [ti for r in res for ti in r[1]]
+					clfs.extend([r[2] for r in res])
+					all_test_target_scores.extend(top_test_target_scores)
+					all_test_decoy_scores.extend(top_test_decoy_scores)
 
-		logging.info("finished cross evals")
+			logging.info("finished cross evals")
+		else:
+			logging.info("start application of pretrained weights")
+			ws.append(loaded_weights.flatten())
+			clf_scores = teacher.score(experiment, loaded_weights)
+			experiment.set_and_rerank("classifier_score", clf_scores)
+
+			all_test_target_scores.extend(experiment.get_top_target_peaks()["classifier_score"])
+			all_test_decoy_scores.extend(experiment.get_top_decoy_peaks()["classifier_score"])
+			logging.info("finished pretrained scoring")
+			
+
 		final_classifier = ConsensusPredictor(clfs)
+		loaded_weights = final_classifier.get_parameters()
 		
 		d = {}
 		d["tg_id"] = experiment.df.tg_num_id.values
@@ -160,16 +176,16 @@ class HolyGostQuery(object):
 
 		results, data_for_persistence = self.apply_classifier(final_classifier, experiment, test_exp,
 															 all_test_target_scores,
-															 all_test_decoy_scores, table)
+															 all_test_decoy_scores, table, p_score=p_score)
 		logging.info("calculated scoring and statistics")
-		return  results, pd.DataFrame(d), data_for_persistence + (score_columns,)
+		return  results, pd.DataFrame(d), data_for_persistence + (score_columns,), loaded_weights
 
 
 
 	@profile
 	def apply_loaded_scorer(self, table, loaded_scorer):
 
-		final_classifier, mu, nu, df_raw_stat, loaded_score_columns = loaded_scorer
+		final_classifier, mu, nu, df_raw_stat, num_null, num_total, loaded_score_columns = loaded_scorer
 
 		prepared_table, __ = prepare_data_table(table, loaded_score_columns=loaded_score_columns)
 
@@ -180,7 +196,9 @@ class HolyGostQuery(object):
 
 		scored_table = self.enrich_table_with_results(table, experiment, df_raw_stat)
 
-		return {'pyProph':(None, None, scored_table)}, None, None
+		trained_weights = final_classifier.get_parameters()
+
+		return {'pyProph':(None, None, scored_table)}, None, None, trained_weights
 
 
 
@@ -203,23 +221,23 @@ class HolyGostQuery(object):
 
 	@profile
 	def apply_classifier(self, final_classifier, experiment, test_exp, all_test_target_scores,
-						 all_test_decoy_scores, table):
+						 all_test_decoy_scores, table, p_score=False):
 
 		lambda_ = CONFIG.get("final_statistics.lambda")
 
 		mu, nu, final_score = self.calculate_params_for_d_score(final_classifier, experiment)
 		experiment["d_score"] = (final_score - mu) / nu
 
-		all_tt_scores = experiment.get_top_target_peaks()["d_score"]
-		
-		def getRes(et):
-			return (et.summary_table(), et.final_table(), et.enrich(table, experiment))
-		
+		if (CONFIG.get("final_statistics.fdr_all_pg")):
+			all_tt_scores = experiment.get_top_target_peaks()["d_score"]
+		else:
+			all_tt_scores = experiment.get_top_target_peaks()["d_score"]
+
 		is_test	 = CONFIG.get("is_test", False)
 		
 		if CONFIG.get("is_test", False):
 			d = {
-				'pyProph-flex':getRes(FlexibleErrorTable(
+				'pyProph-flex':FlexibleErrorTable(
 									all_tt_scores,
 									all_test_target_scores,
 									all_test_decoy_scores,
@@ -228,8 +246,8 @@ class HolyGostQuery(object):
 									PyProphFDRCalc(),
 									PyProphStatCalc(),
 									PyProphStatSampler()
-							)), 
-				'nonParam-flex':getRes(FlexibleErrorTable(
+							), 
+				'nonParam-flex':FlexibleErrorTable(
 									all_tt_scores,
 									all_test_target_scores,
 									all_test_decoy_scores,
@@ -238,8 +256,8 @@ class HolyGostQuery(object):
 									PyProphFDRCalc(),
 									PyProphStatCalc(),
 									PyProphStatSampler()
-							)),
-				'logNormal-flex':getRes(FlexibleErrorTable(
+							),
+				'logNormal-flex':FlexibleErrorTable(
 									all_tt_scores,
 									all_test_target_scores,
 									all_test_decoy_scores,
@@ -248,8 +266,8 @@ class HolyGostQuery(object):
 									PyProphFDRCalc(),
 									PyProphStatCalc(),
 									PyProphStatSampler()
-							)),
-				'nonParam-storey':getRes(FlexibleErrorTable(
+							),
+				'nonParam-storey':FlexibleErrorTable(
 									all_tt_scores,
 									all_test_target_scores,
 									all_test_decoy_scores,
@@ -258,8 +276,8 @@ class HolyGostQuery(object):
 									StoreyFDRCalc(),
 									PyProphStatCalc(),
 									PyProphStatSampler()
-							)),
-				'nonParam-storey-jt':getRes(FlexibleErrorTable(
+							),
+				'nonParam-storey-jt':FlexibleErrorTable(
 									all_tt_scores,
 									all_test_target_scores,
 									all_test_decoy_scores,
@@ -268,7 +286,7 @@ class HolyGostQuery(object):
 									StoreyFDRCalc(),
 									JTStatCalc(),
 									PyProphStatSampler()
-							))
+							)
 				}
 			
 			d["res"] = d["nonParam-flex"]
@@ -276,7 +294,7 @@ class HolyGostQuery(object):
 			if test_exp is not None:
 				muT, nuT, final_scoreT = self.calculate_params_for_d_score(final_classifier, test_exp)
 				test_exp["d_score"] = (final_scoreT - muT) / nuT
-				d['true_pyProph'] = getRes(FlexibleErrorTable(
+				d['true_pyProph'] = FlexibleErrorTable(
 						all_tt_scores, 
 						test_exp.get_top_target_peaks()["d_score"],
 						test_exp.get_top_decoy_peaks()["d_score"],
@@ -285,8 +303,8 @@ class HolyGostQuery(object):
 						PyProphFDRCalc(),
 						PyProphStatCalc(),
 						PyProphStatSampler()
-					))
-				d['true_nonParam'] = getRes(FlexibleErrorTable(
+					)
+				d['true_nonParam'] = FlexibleErrorTable(
 						all_tt_scores, 
 						test_exp.get_top_target_peaks()["d_score"],
 						test_exp.get_top_decoy_peaks()["d_score"],
@@ -295,8 +313,8 @@ class HolyGostQuery(object):
 						PyProphFDRCalc(),
 						PyProphStatCalc(),
 						PyProphStatSampler()
-					))
-				d['true_logNormal'] = getRes(FlexibleErrorTable(
+					)
+				d['true_logNormal'] = FlexibleErrorTable(
 						all_tt_scores,
 						test_exp.get_top_target_peaks()["d_score"],
 						test_exp.get_top_decoy_peaks()["d_score"],
@@ -305,7 +323,7 @@ class HolyGostQuery(object):
 						PyProphFDRCalc(),
 						PyProphStatCalc(),
 						PyProphStatSampler()
-					))
+					)
 		else:
 			 null_model 	= getNullModel(CONFIG.get("final_statistics.null_model"))
 			 fdr_calc 		= getFDRCalc(CONFIG.get("final_statistics.fdr_calc"))
@@ -313,7 +331,7 @@ class HolyGostQuery(object):
 			 stat_sampler 	= getStatSampler(CONFIG.get("final_statistics.stat_sampler"))
 			 decoys_missing	= CONFIG.get("decoy.missing", 0.0)
 			 d = dict(
-			 		res = getRes(FlexibleErrorTable(
+			 		res = FlexibleErrorTable(
 						all_tt_scores,
 						all_test_target_scores,
 						all_test_decoy_scores,
@@ -323,24 +341,67 @@ class HolyGostQuery(object):
 						stat_calc,
 						stat_sampler,
 						decoys_missing
-					))
+					)
 			 	)
 
+		def getRes(et):
+			return (et.summary_table(), et.final_table(), et.enrich(table, experiment))
 
-		needed_to_persist = (final_classifier, mu, nu)
-							 #error_table.df_raw_stat.loc[:, ["svalue", "qvalue", "cutoff"]])
-		return d, needed_to_persist
+		et = d["res"]
+		sum_tab, fin_tab, score_tab = getRes(d["res"])
+
+		if CONFIG.get("compute.probabilities"):
+			logging.info( "" )
+			logging.info( "Posterior Probability estimation:" )
+			logging.info( "Estimated number of null %0.2f out of a total of %s. " % (et.num_null, et.num_total) )
+
+			# Note that num_null and num_total are the sum of the
+			# cross-validated statistics computed before, therefore the total
+			# number of data points selected will be 
+			#	len(data) /  xeval.fraction * xeval.num_iter
+			# 
+			prior_chrom_null = et.num_null * 1.0 / et.num_total
+			number_true_chromatograms = (1.0-prior_chrom_null) * len(experiment.get_top_target_peaks().df)
+			number_target_pg = len( Experiment(experiment.df[(experiment.df.is_decoy == False) ]).df )
+			prior_peakgroup_true = number_true_chromatograms / number_target_pg
+
+			logging.info( "Prior for a peakgroup: %s" % (number_true_chromatograms / number_target_pg))
+			logging.info( "Prior for a chromatogram: %s" % str(1-prior_chrom_null) )
+			logging.info( "Estimated number of true chromatograms: %s out of %s" % (number_true_chromatograms, le$
+			logging.info( "Number of target data: %s" % len( Experiment(experiment.df[(experiment.df.is_decoy == $
+
+			# pg_score = posterior probability for each peakgroup
+			# h_score = posterior probability for the hypothesis that this peakgroup is true (and all other false)
+			# h0_score = posterior probability for the hypothesis that no peakgroup is true
+
+			pp_pg_pvalues = posterior_pg_prob(experiment, prior_peakgroup_true, lambda_=lambda_)
+			experiment.df[ "pg_score"]  = pp_pg_pvalues
+			score_tab = score_tab.join(experiment[["pg_score"]])
+
+			allhypothesis, h0 = posterior_chromatogram_hypotheses_fast(experiment, prior_chrom_null)
+			experiment.df[ "h_score"]  = allhypothesis
+			experiment.df[ "h0_score"]  = h0
+			score_tab = score_tab.join(experiment[["h_score", "h0_score"]])
+
+		needed_to_persist = (final_classifier, mu, nu,
+					et.df.loc[:, ["svalue", "qvalue", "cutoff"]], et.num_null, et.num_total)
+		return (sum_tab, fin_tab, score_tab), d, needed_to_persist
+
 
 	@profile
 	def calculate_params_for_d_score(self, classifier, experiment):
 		score = classifier.score(experiment, True)
 		experiment.set_and_rerank("classifier_score", score)
-		td_scores = experiment.get_top_decoy_peaks()["classifier_score"]
+
+		if (CONFIG.get("final_statistics.fdr_all_pg")):
+			td_scores = experiment.get_decoy_peaks()["classifier_score"]
+		else:
+			td_scores = experiment.get_top_decoy_peaks()["classifier_score"]
 		
-		mu = 0#mu = np.median(td_scores)
-		nu = 1#nu = np.percentile(td_scores, 95.0)
+		#mu = 0#mu = np.median(td_scores)
+		#nu = 1#nu = np.percentile(td_scores, 95.0)
 				
-		#mu, nu = mean_and_std_dev(td_scores)
+		mu, nu = mean_and_std_dev(td_scores)
 		return mu, nu, score
 
 

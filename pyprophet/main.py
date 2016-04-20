@@ -7,7 +7,7 @@ os.putenv("OPENBLAS_NUM_THREADS", "1")
 
 try:
 	profile
-except:
+except NameError:
 	profile = lambda x: x
 
 from pyprophet import PyProphet, HolyGostQuery
@@ -15,15 +15,16 @@ from classifiers import SGDLearner, LDALearner, LinearSVMLearner, RbfSVMLearner,
 from semi_supervised import StandardSemiSupervisedTeacher
 
 from config import standard_config, fix_config_types
-from report import save_report
+from report import save_report, export_mayu
 import sys
 import time
 import warnings
 import logging
 import cPickle
 import zlib
-import pandas as pd
 
+#import pandas as pd
+import numpy as np
 
 def print_help():
 	print
@@ -71,7 +72,7 @@ def _main(args):
 	options = dict()
 	path = None
 	
-	print "PyProphet, DIANA edition - built Tue May 27 15:52:00 CEST 2014"
+	print "PyProphet, unified edition
 	
 	if "--help" in args:
 		print_help()
@@ -113,19 +114,19 @@ def _main(args):
 	basename = os.path.basename(path)
 	prefix, __ = os.path.splitext(basename)
 
-	persisted = None
-	apply_ = CONFIG.get("apply")
-	if apply_:
-		if not os.path.exists(apply_):
-			raise Exception("scorer file %s does not exist" % apply_)
+	persisted_scorer = None
+	apply_scorer = CONFIG.get("apply_scorer")
+	if apply_scorer:
+		if not os.path.exists(apply_scorer):
+			raise Exception("scorer file %s does not exist" % apply_scorer)
 		try:
-			persisted = cPickle.loads(zlib.decompress(open(apply_, "rb").read()))
+			persisted_scorer = cPickle.loads(zlib.decompress(open(apply_scorer, "rb").read()))
 		except:
 			import traceback
 			traceback.print_exc()
 			raise
 
-	apply_existing_scorer = persisted is not None
+	apply_existing_scorer = persisted_scorer is not None
 
 	class Paths(dict):
 		def __init__(self, prefix=prefix, dirname=dirname, **kw):
@@ -134,25 +135,33 @@ def _main(args):
 		__getattr__ = dict.__getitem__
 
 	paths = Paths(scored_table="_with_dscore.csv",
+					filtered_table="_with_dscore_filtered.csv",
 					output="_output.csv",
 					final_stat="_full_stat.csv",
 					summ_stat="_summary_stat.csv",
 					report="_report.pdf",
 					cutoffs="_cutoffs.txt",
 					svalues="_svalues.txt",
-					qvalues="_qvalues.txt",
 					d_scores_top_target_peaks="_dscores_top_target_peaks.txt",
 					d_scores_top_decoy_peaks="_dscores_top_decoy_peaks.txt",
-	)
+					mayu_cutoff="_mayu.cutoff",
+					mayu_fasta="_mayu.fasta",
+					mayu_csv="_mayu.csv",
+					)
 
 	if not apply_existing_scorer:
 		pickled_scorer_path = os.path.join(dirname, prefix + "_scorer.bin")
+
+	if not apply_existing_weights:
+		trained_weights_path = os.path.join(dirname, prefix + "_weights.txt")
 
 	if not CONFIG.get("target.overwrite", False):
 		found_existing_file = False
 		to_check = list(paths.keys())
 		if not apply_existing_scorer:
 			to_check.append(pickled_scorer_path)
+		if not apply_existing_weights:
+			to_check.append(trained_weights_path)
 		for p in to_check:
 			if os.path.exists(p):
 				found_existing_file = True
@@ -192,7 +201,7 @@ def _main(args):
 			return
 		
 		method = HolyGostQuery(StandardSemiSupervisedTeacher(classifier))
-		result_tables, clfs_df, needed_to_persist = method.process_csv(path, delim_in, persisted)
+		result_tables, clfs_df, needed_to_persist, trained_weights = method.process_csv(path, delim_in, persisted_scorer, persisted_weights)
 		#(summ_stat, final_stat, scored_table) = pyp_res
 		#(summ_statT, final_statT, scored_tableT) = true_res
 	
@@ -226,6 +235,9 @@ def _main(args):
 		#	print "WRITTEN: ", paths.summ_stat
 		#	plot_data = save_report(paths.reportT, basename, scored_tableT, final_statT)
 		#	print "WRITTEN: ", paths.report
+		if summ_stat is not None:
+			summ_stat.to_csv(paths.summ_stat, sep=delim_out, index=False)
+			print "WRITTEN: ", paths.summ_stat
 
 		if final_stat is not None:
 			plot_data = save_report(paths.report, basename, scored_table, final_stat)
@@ -248,15 +260,32 @@ def _main(args):
 			clfs_df.to_csv("clfs.csv", sep=delim_out, index=False)
 			print "WRITTEN: ", "clfs.csv"
 		
+		scored_table.to_csv(pathes.scored_table, sep=delim_out, index=False)
+		print "WRITTEN: ", paths.scored_table
+
 		output = scored_table.rename(columns = {"d_score" : "pyProph_score", "m_score" : "qvalue"})
 		output.to_csv(paths.output, sep=delim_out, index=False)
 		print "WRITTEN: ", paths.output
+
+		filtered_table = scored_table[scored_table.d_score > CONFIG.get("d_score.cutoff")]
+		filtered_table.to_csv(paths.filtered_table, sep=delim_out, index=False)
+		print "WRITTEN: ", paths.filtered_table
 		
 		if not apply_existing_scorer and CONFIG.get("all.output"):
 			bin_data = zlib.compress(cPickle.dumps(needed_to_persist, protocol=2))
 			with open(pickled_scorer_path, "wb") as fp:
 				fp.write(bin_data)
 			print "WRITTEN: ", pickled_scorer_path
+
+		if not apply_existing_weights:
+			np.savetxt(trained_weights_path,trained_weights,delimiter="\t")
+			print "WRITTEN: ", trained_weights_path
+
+		if CONFIG.get("export.mayu", True):
+			export_mayu(paths.mayu_cutoff, paths.mayu_fasta, paths.mayu_csv, scored_table, final_stat)
+			print "WRITTEN: ", paths.mayu_cutoff
+			print "WRITTEN: ", paths.mayu_fasta
+			print "WRITTEN: ", paths.mayu_csv
 		print
 
 	seconds = int(needed)
@@ -264,11 +293,5 @@ def _main(args):
 	minutes = int(needed / 60.0)
 	hours 	= int(minutes / 60.0)
 
-	print "NEEDED",
-	if hours:
-		print hours, "hours and",
-	if minutes:
-		print minutes, "minutes and",
-
-	print "%d seconds and %d msecs wall time" % (seconds, msecs)
+	print "NEEDED %02d:%02d:%02d.%03d wall time" % (hours, minutes, seconds, msecs)
 	print
